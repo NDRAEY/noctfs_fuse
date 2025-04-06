@@ -3,13 +3,13 @@ pub mod ino_cache;
 use ino_cache::INOCache;
 use noctfs::{
     self, BlockAddress, NoctFS,
-    entity::{Entity, EntityFlags},
+    entity::Entity,
 };
 
-use std::{ffi::c_int, fs::File, io};
+use std::{ffi::c_int, io};
 
 use fuse::{FileAttr, FileType, Filesystem, Request};
-use libc::{EIO, ENOENT, ENOMEDIUM, ENOSYS, O_ACCMODE, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY};
+use libc::{EIO, ENOENT, ENOSYS, O_RDONLY, O_RDWR, O_WRONLY};
 
 pub struct NoctFSFused<'a> {
     fs: NoctFS<'a>,
@@ -91,9 +91,7 @@ impl NoctFSFused<'_> {
 
         Some(
             self.fhs_opened
-                .iter()
-                .filter(|x| x.0 == fh)
-                .next()
+                .iter().find(|x| x.0 == fh)
                 .unwrap()
                 .1,
         )

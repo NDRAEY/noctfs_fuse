@@ -7,6 +7,12 @@ pub struct INOCache {
     container: Vec<CacheEntry>,
 }
 
+impl Default for INOCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl INOCache {
     pub fn new() -> Self {
         Self {
@@ -24,9 +30,7 @@ impl INOCache {
 
     pub fn find_parent(&mut self, ino: u64) -> Option<u64> {
         self.container
-            .iter()
-            .filter(|a| a.ino == ino)
-            .next()
+            .iter().find(|a| a.ino == ino)
             .map(|a| a.parent_ino)
     }
 }
