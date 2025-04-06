@@ -1,0 +1,14 @@
+getattr 1
+access: Request { ch: ChannelSender { fd: 3 }, header: fuse_in_header { len: 48, opcode: 34, unique: 8, nodeid: 1, uid: 1000, gid: 1000, pid: 40333, padding: 0 }, data: [0, 0, 0, 0, 0, 0, 0, 0] } 1 0
+opendir 1 100352
+Pushed fh: 1
+readdir 1 1 0
+Removed fh: 1
+lookup 1 "file.txt"
+lookup 1 "directory"
+lookup 1 "new_file.txt"
+lookup 1 "another"
+readdir 1 1 0
+getattr 1
+access: Request { ch: ChannelSender { fd: 3 }, header: fuse_in_header { len: 48, opcode: 34, unique: 32, nodeid: 1, uid: 1000, gid: 1000, pid: 40341, padding: 0 }, data: [0, 0, 0, 0, 0, 0, 0, 0] } 1 0
+Result: Ok(())
