@@ -9,7 +9,7 @@ use noctfs::{
 use std::{ffi::c_int, fs::File, io};
 
 use fuse::{FileAttr, FileType, Filesystem, Request};
-use libc::{EIO, ENOENT, ENOSYS, O_CREAT, O_RDONLY, O_WRONLY};
+use libc::{EIO, ENOENT, ENOMEDIUM, ENOSYS, O_ACCMODE, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY};
 
 pub struct NoctFSFused<'a> {
     fs: NoctFS<'a>,
@@ -158,20 +158,19 @@ impl Filesystem for NoctFSFused<'_> {
         }
 
         let entity = entity.unwrap();
+        self.ino_cache.add(_parent, entity.start_block);
 
         reply.entry(
             &time::get_time(),
             &self.entity_attrs_to_fuse_attrs(&entity),
             0,
         );
-
-        self.ino_cache.add(_parent, entity.start_block);
     }
 
     fn forget(&mut self, _req: &fuse::Request, _ino: u64, _nlookup: u64) {}
 
     fn getattr(&mut self, _req: &fuse::Request, _ino: u64, reply: fuse::ReplyAttr) {
-        println!("getattr {_ino}");
+        println!("getattr on ino/{_ino}");
 
         if _ino == 1 {
             reply.attr(
@@ -197,6 +196,8 @@ impl Filesystem for NoctFSFused<'_> {
             let entity = self.noct_search_by_block(_ino);
 
             if entity.is_none() {
+                println!("\x1b[31;1mNo entry! ENOENT!\x1b[0m");
+
                 reply.error(ENOENT);
                 return;
             }
@@ -209,8 +210,47 @@ impl Filesystem for NoctFSFused<'_> {
         }
     }
 
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
+        _atime: Option<time::Timespec>,
+        _mtime: Option<time::Timespec>,
+        _fh: Option<u64>,
+        _crtime: Option<time::Timespec>,
+        _chgtime: Option<time::Timespec>,
+        _bkuptime: Option<time::Timespec>,
+        _flags: Option<u32>,
+        reply: fuse::ReplyAttr,
+    ) {
+        println!(
+            "setattr on ino/{_ino}; mode: {_mode:?}, uid: {_uid:?}, gid: {_gid:?}, size: {_size:?},
+             atime: {_atime:?}, mtime: {_mtime:?}, fh: {_fh:?}, flags: {_flags:?}"
+        );
+
+        let entity = self.noct_search_by_block(_ino);
+
+        if entity.is_none() {
+            reply.error(ENOENT);
+            return;
+        }
+
+        let entity = entity.unwrap();
+
+        reply.attr(
+            &time::get_time(),
+            &self.entity_attrs_to_fuse_attrs(&entity)
+        );
+        // reply.error(ENOSYS);
+    }
+
     fn readlink(&mut self, _req: &fuse::Request, _ino: u64, reply: fuse::ReplyData) {
-        println!("readlink");
+        println!("u/i: readlink on ino/{_ino}");
+
         reply.error(ENOSYS);
     }
 
@@ -239,8 +279,6 @@ impl Filesystem for NoctFSFused<'_> {
         println!("mkdir on {_parent} with name {_name:?}");
 
         let entity = self.fs.create_directory(_parent, _name.to_str().unwrap());
-
-        // reply.error(ENOSYS);
         
         reply.entry(
             &time::get_time(),
@@ -263,6 +301,7 @@ impl Filesystem for NoctFSFused<'_> {
         let entity = self.search_by_filename(_parent, _name.to_str().unwrap());
 
         if entity.is_none() {
+            println!("\x1b[31;1mNo entry! ENOENT!\x1b[0m");
             reply.error(ENOENT);
             return;
         }
@@ -272,7 +311,6 @@ impl Filesystem for NoctFSFused<'_> {
         self.fs.delete_file(_parent, &entity);
 
         reply.ok();
-        // reply.error(ENOSYS);
     }
 
     fn rmdir(
@@ -295,6 +333,8 @@ impl Filesystem for NoctFSFused<'_> {
         _link: &std::path::Path,
         reply: fuse::ReplyEntry,
     ) {
+        println!("u/i: symlink on {_parent}, name: {_name:?}");
+
         reply.error(ENOSYS);
     }
 
@@ -322,21 +362,25 @@ impl Filesystem for NoctFSFused<'_> {
         _newname: &std::ffi::OsStr,
         reply: fuse::ReplyEntry,
     ) {
+        println!("u/i: link on ino/{_ino} newparent is: {_newparent}, newname is: {_newname:?}");
+
         reply.error(ENOSYS);
     }
 
     fn open(&mut self, _req: &fuse::Request, _ino: u64, _flags: u32, reply: fuse::ReplyOpen) {
-        println!("open {_ino}");
-
-        let fh = self.next_fh();
+        println!("open {_ino} flags: {_flags:x}");
 
         let read_flag = _flags & O_RDONLY as u32;
         let write_flag = _flags & O_WRONLY as u32;
-        let create_flag = _flags & O_CREAT as u32;
+        let rdwr_flag = _flags & O_RDWR as u32;
 
-        println!("Read: {read_flag}; Write: {write_flag}; Create: {create_flag}");
+        println!("Read: {read_flag}; Write: {write_flag}; RDWR: {rdwr_flag}");
+        
+        let fh = self.next_fh();
 
-        reply.opened(fh, 0);
+        self.allocate_fh(fh, _ino);
+
+        reply.opened(fh, _flags & 0b111);
     }
 
     fn read(
@@ -364,6 +408,7 @@ impl Filesystem for NoctFSFused<'_> {
         let ent = self.fs.get_entity_by_parent_and_block(dir_ino, _ino);
 
         if ent.is_none() {
+            println!("\x1b[31;1mNo entry! ENOENT!\x1b[0m");
             reply.error(ENOENT);
             return;
         }
@@ -407,6 +452,7 @@ impl Filesystem for NoctFSFused<'_> {
         let ent = self.fs.get_entity_by_parent_and_block(dir_ino, _ino);
 
         if ent.is_none() {
+            println!("\x1b[31;1mNo entry! ENOENT!\x1b[0m");
             reply.error(ENOENT);
             return;
         }
@@ -429,8 +475,6 @@ impl Filesystem for NoctFSFused<'_> {
         _lock_owner: u64,
         reply: fuse::ReplyEmpty,
     ) {
-        // reply.error(ENOSYS);
-
         reply.ok();
     }
 
@@ -456,7 +500,7 @@ impl Filesystem for NoctFSFused<'_> {
         reply: fuse::ReplyEmpty,
     ) {
         println!("fsync");
-        // reply.error(ENOSYS);
+
         reply.ok();
     }
 
@@ -476,12 +520,16 @@ impl Filesystem for NoctFSFused<'_> {
         println!("== Other dir!");
         let ent = self.noct_search_by_block(_ino);
         if ent.is_none() {
+            println!("\x1b[31;1mNo entry! ENOENT!\x1b[0m");
+
             reply.error(ENOENT);
             return;
         }
         let ent = ent.unwrap();
 
         if !ent.is_directory() {
+            println!("\x1b[31;1mIs not a directory! ENOENT!\x1b[0m");
+
             reply.error(ENOENT);
             return;
         }
@@ -583,7 +631,10 @@ impl Filesystem for NoctFSFused<'_> {
         _size: u32,
         reply: fuse::ReplyXattr,
     ) {
-        println!("u/i: getxattr on {_ino} with name {_name:?}");
+        println!("u/i: getxattr on {_ino} with name {_name:?}, size: {_size}");
+
+        // reply.size(_size as _);
+
         reply.error(ENOSYS);
     }
 
@@ -630,40 +681,27 @@ impl Filesystem for NoctFSFused<'_> {
             "Create {_name:?} on ino/{_parent} with mode(o) {_mode:o} and flags(x) {_flags:x}"
         );
 
-        if _parent == 1 {
-            _parent = self.fs.get_root_entity().unwrap().start_block;
-        }
+        let entity = self.fs.create_file(_parent, _name.to_str().unwrap());
 
-        let entry = self.fs.create_file(_parent, _name.to_str().unwrap());
+        let fh = self.next_fh();
+        self.allocate_fh(fh, entity.start_block);
+
+        self.ino_cache.add(_parent, entity.start_block);
+
+        let read_flag = _flags & O_RDONLY as u32;
+        let write_flag = _flags & O_WRONLY as u32;
+        let rdwr_flag = _flags & O_RDWR as u32;
+
+        println!("Read: {read_flag}; Write: {write_flag}; RDWR: {rdwr_flag}");
 
         reply.created(
             &time::get_time(),
-            &FileAttr {
-                ino: entry.start_block,
-                size: entry.size,
-                blocks: entry.size * self.fs.block_size() as u64,
-                atime: time::get_time(),
-                mtime: time::get_time(),
-                ctime: time::get_time(),
-                crtime: time::get_time(),
-                kind: if entry.flags.contains(EntityFlags::DIRECTORY) {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                },
-                perm: 0o666,
-                nlink: 0,
-                uid: 0,
-                gid: 0,
-                rdev: 0,
-                flags: 0,
-            },
+            &self.entity_attrs_to_fuse_attrs(&entity),
             0,
-            self.next_fh(),
-            _flags,
+            fh,
+            _flags & 0b111,
+            // O_RDWR.try_into().unwrap(),
         );
-
-        self.ino_cache.add(_parent, entry.start_block);
     }
 
     fn getlk(
@@ -709,63 +747,8 @@ impl Filesystem for NoctFSFused<'_> {
         _idx: u64,
         reply: fuse::ReplyBmap,
     ) {
+        println!("u/i: bmap on ino/{_ino}, blocksize: {_blocksize}, index: {_idx}");
         reply.error(ENOSYS);
-    }
-
-    fn setattr(
-        &mut self,
-        _req: &Request,
-        _ino: u64,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<time::Timespec>,
-        _mtime: Option<time::Timespec>,
-        _fh: Option<u64>,
-        _crtime: Option<time::Timespec>,
-        _chgtime: Option<time::Timespec>,
-        _bkuptime: Option<time::Timespec>,
-        _flags: Option<u32>,
-        reply: fuse::ReplyAttr,
-    ) {
-        println!(
-            "setattr on ino/{_ino}; mode: {_mode:?}, uid: {_uid:?}, gid: {_gid:?}, size: {_size:?}"
-        );
-
-        let entry = self.noct_search_by_block(_ino);
-
-        if entry.is_none() {
-            reply.error(ENOENT);
-            return;
-        }
-
-        let entry = entry.unwrap();
-
-        reply.attr(
-            &time::get_time(),
-            &FileAttr {
-                ino: _ino,
-                size: entry.size,
-                blocks: entry.size * self.fs.block_size() as u64,
-                atime: time::get_time(),
-                mtime: time::get_time(),
-                ctime: time::get_time(),
-                crtime: time::get_time(),
-                kind: if entry.is_directory() {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                },
-                perm: 0o666,
-                nlink: 0,
-                uid: 0,
-                gid: 0,
-                rdev: 0,
-                flags: 0,
-            },
-        );
-        // reply.error(ENOSYS);
     }
 }
 
