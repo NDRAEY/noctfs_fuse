@@ -2,10 +2,13 @@
 name = "noctfs-linux-fuse"
 version = "0.1.0"
 edition = "2024"
+authors = ["NDRAEY <pikachu_andrey@vk.com>"]
+license = "MIT"
 
 [dependencies]
+# noctfs = { git = "https://github.com/NDRAEY/noctfs" }
+noctfs = { path = "../noctfs/" }
 fuser = "0.15.1"
 libc = "0.2.171"
 no_std_io = { version = "0.6.0", features = ["alloc"] }
-noctfs = { path = "../noctfs" }
 time = "0.1.45"

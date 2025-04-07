@@ -39,8 +39,6 @@ impl NoctFSFused<'_> {
         let lsr = self.fs.list_directory(root.start_block);
 
         for i in &lsr {
-            println!("{i:?} != {block}");
-
             if i.is_directory() && ![".", ".."].contains(&i.name.as_str()) {
                 return self.noct_search_by_block(i.start_block);
             }
@@ -456,6 +454,7 @@ impl Filesystem for NoctFSFused<'_> {
         let ent = self.fs.get_entity_by_parent_and_block(dir_ino, ino);
 
         if ent.is_none() {
+            // Maybe file is deleted when read is performed idk what to do, let's throw ENOENT then!
             println!("\x1b[31;1mNo entry! ENOENT!\x1b[0m");
             reply.error(ENOENT);
             return;
@@ -720,18 +719,12 @@ impl Filesystem for NoctFSFused<'_> {
 
         self.ino_cache.add(parent, entity.start_block);
 
-        let read_flag = flags & O_RDONLY;
-        let write_flag = flags & O_WRONLY;
-        let rdwr_flag = flags & O_RDWR;
-
-        println!("Read: {read_flag}; Write: {write_flag}; RDWR: {rdwr_flag}");
-
         reply.created(
             &DEFAULT_DURATION,
             &self.entity_attrs_to_fuse_attrs(&entity),
             0,
             fh,
-            flags.try_into().unwrap(),
+            flags as u32 & 0b111,
             // O_RDWR.try_into().unwrap(),
         );
     }
