@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fuse = "0.3.1"
+fuser = "0.15.1"
 libc = "0.2.171"
 no_std_io = { version = "0.6.0", features = ["alloc"] }
 noctfs = { path = "../noctfs" }

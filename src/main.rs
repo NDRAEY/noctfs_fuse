@@ -1,15 +1,16 @@
 pub mod ino_cache;
 
 use ino_cache::INOCache;
-use noctfs::{
-    self, BlockAddress, NoctFS,
-    entity::Entity,
+use noctfs::{self, BlockAddress, NoctFS, entity::Entity};
+
+use std::{
+    ffi::OsStr,
+    io,
+    time::{Duration, SystemTime},
 };
 
-use std::{ffi::c_int, io};
-
-use fuse::{FileAttr, FileType, Filesystem, Request};
-use libc::{EIO, ENOENT, ENOSYS, O_RDONLY, O_RDWR, O_WRONLY};
+use fuser::{FileAttr, FileType, Filesystem, MountOption, Request};
+use libc::{EIO, ENOENT, ENOSYS, O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY};
 
 pub struct NoctFSFused<'a> {
     fs: NoctFS<'a>,
@@ -38,7 +39,9 @@ impl NoctFSFused<'_> {
         let lsr = self.fs.list_directory(root.start_block);
 
         for i in &lsr {
-            if i.is_directory() {
+            println!("{i:?} != {block}");
+
+            if i.is_directory() && ![".", ".."].contains(&i.name.as_str()) {
                 return self.noct_search_by_block(i.start_block);
             }
 
@@ -89,12 +92,7 @@ impl NoctFSFused<'_> {
             return None;
         }
 
-        Some(
-            self.fhs_opened
-                .iter().find(|x| x.0 == fh)
-                .unwrap()
-                .1,
-        )
+        Some(self.fhs_opened.iter().find(|x| x.0 == fh).unwrap().1)
     }
 
     fn free_fh(&mut self, fh: u64) {
@@ -103,16 +101,13 @@ impl NoctFSFused<'_> {
     }
 
     fn entity_attrs_to_fuse_attrs(&self, entity: &Entity) -> FileAttr {
-        let no_ts = time::Timespec {
-            sec: 0,
-            nsec: 0,
-        };
+        let no_ts = SystemTime::UNIX_EPOCH;
 
         FileAttr {
             ino: entity.start_block,
             size: entity.size,
             blocks: entity.size * self.fs.block_size() as u64,
-            atime: time::get_time(),
+            atime: SystemTime::now(),
             mtime: no_ts,
             ctime: no_ts,
             crtime: no_ts,
@@ -121,33 +116,40 @@ impl NoctFSFused<'_> {
             } else {
                 FileType::RegularFile
             },
-            perm: 0o755,
+            perm: 0o644,
             nlink: 0,
             uid: 0,
             gid: 0,
             rdev: 0,
             flags: 0,
+            blksize: self.fs.block_size() as u32,
         }
     }
 }
 
+const DEFAULT_DURATION: Duration = Duration::from_secs(3600);
+
 impl Filesystem for NoctFSFused<'_> {
-    fn init(&mut self, _req: &fuse::Request) -> Result<(), c_int> {
+    fn init(
+        &mut self,
+        _req: &Request<'_>,
+        _config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
         Ok(())
     }
 
-    fn destroy(&mut self, _req: &fuse::Request) {}
+    fn destroy(&mut self) {}
 
     fn lookup(
         &mut self,
-        _req: &fuse::Request,
-        _parent: u64,
-        _name: &std::ffi::OsStr,
-        reply: fuse::ReplyEntry,
+        _req: &fuser::Request,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEntry,
     ) {
-        println!("lookup {_parent} {_name:?}");
+        println!("lookup(parent: {:#x?}, name {:?})", parent, name);
 
-        let entity = self.search_by_filename(_parent, _name.to_str().unwrap());
+        let entity = self.search_by_filename(parent, name.to_str().unwrap());
 
         if entity.is_none() {
             println!("lookup failed!");
@@ -156,31 +158,37 @@ impl Filesystem for NoctFSFused<'_> {
         }
 
         let entity = entity.unwrap();
-        self.ino_cache.add(_parent, entity.start_block);
+        self.ino_cache.add(parent, entity.start_block);
 
         reply.entry(
-            &time::get_time(),
+            &DEFAULT_DURATION,
             &self.entity_attrs_to_fuse_attrs(&entity),
             0,
         );
     }
 
-    fn forget(&mut self, _req: &fuse::Request, _ino: u64, _nlookup: u64) {}
+    fn forget(&mut self, _req: &fuser::Request, _ino: u64, _nlookup: u64) {}
 
-    fn getattr(&mut self, _req: &fuse::Request, _ino: u64, reply: fuse::ReplyAttr) {
-        println!("getattr on ino/{_ino}");
+    fn getattr(
+        &mut self,
+        _req: &fuser::Request,
+        ino: u64,
+        _fh: Option<u64>,
+        reply: fuser::ReplyAttr,
+    ) {
+        println!("getattr on ino/{ino}");
 
-        if _ino == 1 {
+        if ino == 1 {
             reply.attr(
-                &time::get_time(),
+                &DEFAULT_DURATION,
                 &FileAttr {
-                    ino: _ino,
+                    ino: ino,
                     size: 4096,
                     blocks: 1,
-                    atime: time::get_time(),
-                    mtime: time::get_time(),
-                    ctime: time::get_time(),
-                    crtime: time::get_time(),
+                    atime: SystemTime::now(),
+                    mtime: SystemTime::UNIX_EPOCH,
+                    ctime: SystemTime::UNIX_EPOCH,
+                    crtime: SystemTime::UNIX_EPOCH,
                     kind: FileType::Directory,
                     perm: 0o666,
                     nlink: 0,
@@ -188,10 +196,11 @@ impl Filesystem for NoctFSFused<'_> {
                     gid: 0,
                     rdev: 0,
                     flags: 0,
+                    blksize: self.fs.block_size() as u32,
                 },
             );
         } else {
-            let entity = self.noct_search_by_block(_ino);
+            let entity = self.noct_search_by_block(ino);
 
             if entity.is_none() {
                 println!("\x1b[31;1mNo entry! ENOENT!\x1b[0m");
@@ -201,36 +210,37 @@ impl Filesystem for NoctFSFused<'_> {
             }
 
             let entity = entity.unwrap();
-            reply.attr(
-                &time::get_time(),
-                &self.entity_attrs_to_fuse_attrs(&entity),
-            );
+            reply.attr(&DEFAULT_DURATION, &self.entity_attrs_to_fuse_attrs(&entity));
         }
     }
 
     fn setattr(
         &mut self,
-        _req: &Request,
-        _ino: u64,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<time::Timespec>,
-        _mtime: Option<time::Timespec>,
-        _fh: Option<u64>,
-        _crtime: Option<time::Timespec>,
-        _chgtime: Option<time::Timespec>,
-        _bkuptime: Option<time::Timespec>,
-        _flags: Option<u32>,
-        reply: fuse::ReplyAttr,
+        _req: &Request<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        flags: Option<u32>,
+        reply: fuser::ReplyAttr,
     ) {
         println!(
-            "setattr on ino/{_ino}; mode: {_mode:?}, uid: {_uid:?}, gid: {_gid:?}, size: {_size:?},
-             atime: {_atime:?}, mtime: {_mtime:?}, fh: {_fh:?}, flags: {_flags:?}"
+            "setattr(ino: {:#x?}, mode: {:?}, uid: {:?}, \
+            gid: {:?}, size: {:?}, fh: {:?}, flags: {:?})",
+            ino, mode, uid, gid, size, fh, flags
         );
 
-        let entity = self.noct_search_by_block(_ino);
+
+
+        let entity = self.noct_search_by_block(ino);
 
         if entity.is_none() {
             reply.error(ENOENT);
@@ -239,14 +249,37 @@ impl Filesystem for NoctFSFused<'_> {
 
         let entity = entity.unwrap();
 
-        reply.attr(
-            &time::get_time(),
-            &self.entity_attrs_to_fuse_attrs(&entity)
-        );
-        // reply.error(ENOSYS);
+        println!("Found entity: {entity:?}");
+
+        let mut new_entity = entity.clone();
+
+        if let Some(size) = size {
+            println!("Want to trunc to: {}!", size);
+
+            if size > entity.size  {
+                println!("TODO! TODO! TODO! Make file bigger! Current size is: {}, setattr wants: {size}", entity.size);
+            }
+
+            new_entity.size = size;
+
+            let parent = self.ino_cache.find_parent(ino);
+
+            if let Some(directory_block) = parent {
+                println!("Writing meta");
+
+                match self.fs.overwrite_entity_header(directory_block, &entity, &new_entity) {
+                    Some(()) => println!("Success!"),
+                    None => println!("Fail!"),
+                }
+            } else {
+                println!("[Error] No parent!");
+            }
+        }
+
+        reply.attr(&DEFAULT_DURATION, &self.entity_attrs_to_fuse_attrs(&new_entity));
     }
 
-    fn readlink(&mut self, _req: &fuse::Request, _ino: u64, reply: fuse::ReplyData) {
+    fn readlink(&mut self, _req: &fuser::Request, _ino: u64, reply: fuser::ReplyData) {
         println!("u/i: readlink on ino/{_ino}");
 
         reply.error(ENOSYS);
@@ -254,45 +287,47 @@ impl Filesystem for NoctFSFused<'_> {
 
     fn mknod(
         &mut self,
-        _req: &fuse::Request,
-        _parent: u64,
-        _name: &std::ffi::OsStr,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &OsStr,
         _mode: u32,
+        _umask: u32,
         _rdev: u32,
-        reply: fuse::ReplyEntry,
+        reply: fuser::ReplyEntry,
     ) {
-        println!("u/i: mknod on {_parent} with name {_name:?}");
+        println!("u/i: mknod on {parent} with name {name:?}");
 
         reply.error(ENOSYS);
     }
 
     fn mkdir(
         &mut self,
-        _req: &fuse::Request,
-        _parent: u64,
+        _req: &fuser::Request,
+        parent: u64,
         _name: &std::ffi::OsStr,
         _mode: u32,
-        reply: fuse::ReplyEntry,
+        _umask: u32,
+        reply: fuser::ReplyEntry,
     ) {
-        println!("mkdir on {_parent} with name {_name:?}");
+        println!("mkdir on {parent} with name {_name:?}");
 
-        let entity = self.fs.create_directory(_parent, _name.to_str().unwrap());
-        
+        let entity = self.fs.create_directory(parent, _name.to_str().unwrap());
+
         reply.entry(
-            &time::get_time(),
+            &DEFAULT_DURATION,
             &self.entity_attrs_to_fuse_attrs(&entity),
             0,
         );
-        
-        self.ino_cache.add(_parent, entity.start_block);
+
+        self.ino_cache.add(parent, entity.start_block);
     }
 
     fn unlink(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _parent: u64,
         _name: &std::ffi::OsStr,
-        reply: fuse::ReplyEmpty,
+        reply: fuser::ReplyEmpty,
     ) {
         println!("u/i: unlink on {_parent} with name {_name:?}");
 
@@ -313,10 +348,10 @@ impl Filesystem for NoctFSFused<'_> {
 
     fn rmdir(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _parent: u64,
         _name: &std::ffi::OsStr,
-        reply: fuse::ReplyEmpty,
+        reply: fuser::ReplyEmpty,
     ) {
         println!("u/i: rmdir on {_parent} with name {_name:?}");
 
@@ -325,11 +360,11 @@ impl Filesystem for NoctFSFused<'_> {
 
     fn symlink(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _parent: u64,
         _name: &std::ffi::OsStr,
         _link: &std::path::Path,
-        reply: fuse::ReplyEntry,
+        reply: fuser::ReplyEntry,
     ) {
         println!("u/i: symlink on {_parent}, name: {_name:?}");
 
@@ -338,12 +373,13 @@ impl Filesystem for NoctFSFused<'_> {
 
     fn rename(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _parent: u64,
         _name: &std::ffi::OsStr,
         _newparent: u64,
         _newname: &std::ffi::OsStr,
-        reply: fuse::ReplyEmpty,
+        _flags: u32,
+        reply: fuser::ReplyEmpty,
     ) {
         println!(
             "u/i: renmae on {_parent} with name {_name:?}; new parent: {_newparent} with new name: {_newname:?}"
@@ -354,46 +390,60 @@ impl Filesystem for NoctFSFused<'_> {
 
     fn link(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _ino: u64,
         _newparent: u64,
         _newname: &std::ffi::OsStr,
-        reply: fuse::ReplyEntry,
+        reply: fuser::ReplyEntry,
     ) {
         println!("u/i: link on ino/{_ino} newparent is: {_newparent}, newname is: {_newname:?}");
 
         reply.error(ENOSYS);
     }
 
-    fn open(&mut self, _req: &fuse::Request, _ino: u64, _flags: u32, reply: fuse::ReplyOpen) {
-        println!("open {_ino} flags: {_flags:x}");
+    fn open(&mut self, _req: &fuser::Request, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
+        println!("open(ino: {ino}, flags: {flags:x})");
 
-        let read_flag = _flags & O_RDONLY as u32;
-        let write_flag = _flags & O_WRONLY as u32;
-        let rdwr_flag = _flags & O_RDWR as u32;
+        let access_mode = flags & O_ACCMODE;
+        println!(
+            "Access mode: {:?}",
+            match access_mode {
+                O_RDONLY => "Read-only",
+                O_WRONLY => "Write-only",
+                O_RDWR => "Read-write",
+                _ => "Unknown",
+            }
+        );
 
-        println!("Read: {read_flag}; Write: {write_flag}; RDWR: {rdwr_flag}");
-        
+        // Check for unsupported flags (e.g., O_TRUNC)
+        if (flags & libc::O_TRUNC) != 0 {
+            println!("O_TRUNC not supported!");
+            reply.error(libc::EINVAL); // Or handle truncation
+            return;
+        }
+
         let fh = self.next_fh();
 
-        self.allocate_fh(fh, _ino);
+        self.allocate_fh(fh, ino);
 
-        reply.opened(fh, _flags & 0b111);
+        reply.opened(fh, flags.try_into().unwrap());
     }
 
     fn read(
         &mut self,
-        _req: &fuse::Request,
-        _ino: u64,
-        _fh: u64,
-        _offset: i64,
-        _size: u32,
-        reply: fuse::ReplyData,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyData,
     ) {
-        println!("read ino/{_ino} fh/{_fh}");
-        println!("ino from fh is: {:?}", self.get_ino(_fh));
+        println!("read ino/{ino} fh/{fh}");
+        println!("ino from fh is: {:?}", self.get_ino(fh));
 
-        let dir_ino = self.ino_cache.find_parent(_ino);
+        let dir_ino = self.ino_cache.find_parent(ino);
         println!("ino cache returns: {:?}", dir_ino);
 
         if dir_ino.is_none() {
@@ -403,7 +453,7 @@ impl Filesystem for NoctFSFused<'_> {
         }
 
         let dir_ino = dir_ino.unwrap();
-        let ent = self.fs.get_entity_by_parent_and_block(dir_ino, _ino);
+        let ent = self.fs.get_entity_by_parent_and_block(dir_ino, ino);
 
         if ent.is_none() {
             println!("\x1b[31;1mNo entry! ENOENT!\x1b[0m");
@@ -413,31 +463,31 @@ impl Filesystem for NoctFSFused<'_> {
 
         let ent = ent.unwrap();
 
-        let mut data = vec![0u8; _size as usize];
+        let mut data = vec![0u8; size as usize];
 
         self.fs
-            .read_contents_by_entity(&ent, &mut data, _offset as _)
+            .read_contents_by_entity(&ent, &mut data, offset as _)
             .unwrap();
 
         reply.data(data.as_slice());
-
-        // reply.error(ENOSYS);
     }
 
     fn write(
         &mut self,
-        _req: &fuse::Request,
-        _ino: u64,
-        _fh: u64,
-        _offset: i64,
-        _data: &[u8],
-        _flags: u32,
-        reply: fuse::ReplyWrite,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
     ) {
-        println!("\x1b[31mwrite\x1b[0m ino/{_ino}; fh/{_fh}");
-        println!("ino from fh is: {:?}", self.get_ino(_fh));
+        println!("\x1b[31mwrite\x1b[0m ino/{ino}; fh/{fh}");
+        println!("ino from fh is: {:?}", self.get_ino(fh));
 
-        let dir_ino = self.ino_cache.find_parent(_ino);
+        let dir_ino = self.ino_cache.find_parent(ino);
         println!("ino cache returns: {:?}", dir_ino);
 
         if dir_ino.is_none() {
@@ -447,7 +497,7 @@ impl Filesystem for NoctFSFused<'_> {
         }
 
         let dir_ino = dir_ino.unwrap();
-        let ent = self.fs.get_entity_by_parent_and_block(dir_ino, _ino);
+        let ent = self.fs.get_entity_by_parent_and_block(dir_ino, ino);
 
         if ent.is_none() {
             println!("\x1b[31;1mNo entry! ENOENT!\x1b[0m");
@@ -460,49 +510,49 @@ impl Filesystem for NoctFSFused<'_> {
         println!("Write on: {}", ent.name);
 
         self.fs
-            .write_contents_by_entity(dir_ino, &ent, _data, _offset.try_into().unwrap());
+            .write_contents_by_entity(dir_ino, &ent, data, offset.try_into().unwrap());
 
-        reply.written(_data.len() as _);
+        reply.written(data.len() as _);
     }
 
     fn flush(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _ino: u64,
         _fh: u64,
         _lock_owner: u64,
-        reply: fuse::ReplyEmpty,
+        reply: fuser::ReplyEmpty,
     ) {
         reply.ok();
     }
 
     fn release(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _ino: u64,
         _fh: u64,
-        _flags: u32,
-        _lock_owner: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         _flush: bool,
-        reply: fuse::ReplyEmpty,
+        reply: fuser::ReplyEmpty,
     ) {
         reply.ok();
     }
 
     fn fsync(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _ino: u64,
         _fh: u64,
         _datasync: bool,
-        reply: fuse::ReplyEmpty,
+        reply: fuser::ReplyEmpty,
     ) {
         println!("fsync");
 
         reply.ok();
     }
 
-    fn opendir(&mut self, _req: &fuse::Request, _ino: u64, _flags: u32, reply: fuse::ReplyOpen) {
+    fn opendir(&mut self, _req: &fuser::Request, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
         println!("opendir {_ino} {_flags}");
 
         if _ino == 1 {
@@ -510,7 +560,7 @@ impl Filesystem for NoctFSFused<'_> {
 
             self.allocate_fh(fh, 1);
 
-            reply.opened(fh, _flags);
+            reply.opened(fh, _flags.try_into().unwrap());
 
             return;
         }
@@ -535,18 +585,18 @@ impl Filesystem for NoctFSFused<'_> {
         let fh = self.next_fh();
         self.allocate_fh(fh, _ino);
 
-        reply.opened(fh, _flags);
+        reply.opened(fh, _flags.try_into().unwrap());
 
         println!("Pushed fh: {}", fh);
     }
 
     fn readdir(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         mut _ino: u64,
         _fh: u64,
         _offset: i64,
-        mut reply: fuse::ReplyDirectory,
+        mut reply: fuser::ReplyDirectory,
     ) {
         println!("readdir {_ino} {_fh} {_offset}");
 
@@ -565,7 +615,7 @@ impl Filesystem for NoctFSFused<'_> {
         }
 
         for i in ents {
-            reply.add(
+            let result: bool = reply.add(
                 i.start_block,
                 0,
                 if i.is_directory() {
@@ -581,83 +631,68 @@ impl Filesystem for NoctFSFused<'_> {
         self.free_fh(_fh);
     }
 
+    fn readdirplus(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        reply: fuser::ReplyDirectoryPlus,
+    ) {
+        println!(
+            "[Not Implemented] readdirplus(ino: {:#x?}, fh: {}, offset: {})",
+            ino, fh, offset
+        );
+        reply.error(ENOSYS);
+    }
+
     fn releasedir(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _ino: u64,
         _fh: u64,
-        _flags: u32,
-        reply: fuse::ReplyEmpty,
+        _flags: i32,
+        reply: fuser::ReplyEmpty,
     ) {
         reply.ok();
     }
 
     fn fsyncdir(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _ino: u64,
         _fh: u64,
         _datasync: bool,
-        reply: fuse::ReplyEmpty,
+        reply: fuser::ReplyEmpty,
     ) {
         reply.ok();
     }
 
-    fn statfs(&mut self, _req: &fuse::Request, _ino: u64, reply: fuse::ReplyStatfs) {
+    fn statfs(&mut self, _req: &fuser::Request, _ino: u64, reply: fuser::ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
     }
 
     fn setxattr(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _ino: u64,
         _name: &std::ffi::OsStr,
         _value: &[u8],
-        _flags: u32,
+        _flags: i32,
         _position: u32,
-        reply: fuse::ReplyEmpty,
+        reply: fuser::ReplyEmpty,
     ) {
         println!("u/i: setxattr on {_ino} with name {_name:?}");
         reply.error(ENOSYS);
     }
 
-    fn getxattr(
-        &mut self,
-        _req: &fuse::Request,
-        _ino: u64,
-        _name: &std::ffi::OsStr,
-        _size: u32,
-        reply: fuse::ReplyXattr,
-    ) {
-        println!("u/i: getxattr on {_ino} with name {_name:?}, size: {_size}");
+    fn access(&mut self, _req: &fuser::Request, _ino: u64, _mask: i32, reply: fuser::ReplyEmpty) {
+        println!("access: on ino/{_ino} with mask/{_mask}");
 
-        // reply.size(_size as _);
-
-        reply.error(ENOSYS);
-    }
-
-    fn listxattr(&mut self, _req: &fuse::Request, _ino: u64, _size: u32, reply: fuse::ReplyXattr) {
-        println!("u/i: listxattr on {_ino} with size: {_size}");
-        reply.error(ENOSYS);
-    }
-
-    fn removexattr(
-        &mut self,
-        _req: &fuse::Request,
-        _ino: u64,
-        _name: &std::ffi::OsStr,
-        reply: fuse::ReplyEmpty,
-    ) {
-        println!("u/i: removexattr on {_ino} with name {_name:?}");
-        reply.error(ENOSYS);
-    }
-
-    fn access(&mut self, _req: &fuse::Request, _ino: u64, _mask: u32, reply: fuse::ReplyEmpty) {
-        println!("access: {_ino} {_mask}");
-
+        // Search inode across entire FS (may be slow, but idk what to do without parent ino)
         let a = self.noct_search_by_block(_ino);
         if a.is_none() {
-            println!("access failed");
+            println!("access failed!");
             reply.error(ENOENT);
             return;
         }
@@ -668,51 +703,50 @@ impl Filesystem for NoctFSFused<'_> {
 
     fn create(
         &mut self,
-        _req: &fuse::Request,
-        mut _parent: u64,
-        _name: &std::ffi::OsStr,
-        _mode: u32,
-        _flags: u32,
-        reply: fuse::ReplyCreate,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        flags: i32,
+        reply: fuser::ReplyCreate,
     ) {
-        println!(
-            "Create {_name:?} on ino/{_parent} with mode(o) {_mode:o} and flags(x) {_flags:x}"
-        );
+        println!("Create {name:?} on ino/{parent} with mode(o) {mode:o} and flags(x) {flags:x}");
 
-        let entity = self.fs.create_file(_parent, _name.to_str().unwrap());
+        let entity = self.fs.create_file(parent, name.to_str().unwrap());
 
         let fh = self.next_fh();
         self.allocate_fh(fh, entity.start_block);
 
-        self.ino_cache.add(_parent, entity.start_block);
+        self.ino_cache.add(parent, entity.start_block);
 
-        let read_flag = _flags & O_RDONLY as u32;
-        let write_flag = _flags & O_WRONLY as u32;
-        let rdwr_flag = _flags & O_RDWR as u32;
+        let read_flag = flags & O_RDONLY;
+        let write_flag = flags & O_WRONLY;
+        let rdwr_flag = flags & O_RDWR;
 
         println!("Read: {read_flag}; Write: {write_flag}; RDWR: {rdwr_flag}");
 
         reply.created(
-            &time::get_time(),
+            &DEFAULT_DURATION,
             &self.entity_attrs_to_fuse_attrs(&entity),
             0,
             fh,
-            _flags & 0b111,
+            flags.try_into().unwrap(),
             // O_RDWR.try_into().unwrap(),
         );
     }
 
     fn getlk(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _ino: u64,
         _fh: u64,
         _lock_owner: u64,
         _start: u64,
         _end: u64,
-        _typ: u32,
+        _typ: i32,
         _pid: u32,
-        reply: fuse::ReplyLock,
+        reply: fuser::ReplyLock,
     ) {
         println!("u/i: getlk on {_ino} with fh {_fh}");
 
@@ -721,16 +755,16 @@ impl Filesystem for NoctFSFused<'_> {
 
     fn setlk(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _ino: u64,
         _fh: u64,
         _lock_owner: u64,
         _start: u64,
         _end: u64,
-        _typ: u32,
+        _typ: i32,
         _pid: u32,
         _sleep: bool,
-        reply: fuse::ReplyEmpty,
+        reply: fuser::ReplyEmpty,
     ) {
         println!("u/i: setlk on {_ino} with fh {_fh}");
 
@@ -739,13 +773,130 @@ impl Filesystem for NoctFSFused<'_> {
 
     fn bmap(
         &mut self,
-        _req: &fuse::Request,
+        _req: &fuser::Request,
         _ino: u64,
         _blocksize: u32,
         _idx: u64,
-        reply: fuse::ReplyBmap,
+        reply: fuser::ReplyBmap,
     ) {
         println!("u/i: bmap on ino/{_ino}, blocksize: {_blocksize}, index: {_idx}");
+        reply.error(ENOSYS);
+    }
+
+    fn ioctl(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        flags: u32,
+        cmd: u32,
+        in_data: &[u8],
+        out_size: u32,
+        reply: fuser::ReplyIoctl,
+    ) {
+        println!(
+            "[Not Implemented] ioctl(ino: {:#x?}, fh: {}, flags: {}, cmd: {}, \
+            in_data.len(): {}, out_size: {})",
+            ino,
+            fh,
+            flags,
+            cmd,
+            in_data.len(),
+            out_size,
+        );
+        reply.error(ENOSYS);
+    }
+
+    fn fallocate(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        length: i64,
+        mode: i32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        println!(
+            "[Not Implemented] fallocate(ino: {:#x?}, fh: {}, offset: {}, \
+            length: {}, mode: {})",
+            ino, fh, offset, length, mode
+        );
+        reply.error(ENOSYS);
+    }
+
+    fn lseek(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        whence: i32,
+        reply: fuser::ReplyLseek,
+    ) {
+        println!(
+            "[Not Implemented] lseek(ino: {:#x?}, fh: {}, offset: {}, whence: {})",
+            ino, fh, offset, whence
+        );
+        reply.error(ENOSYS);
+    }
+
+    fn copy_file_range(
+        &mut self,
+        _req: &Request<'_>,
+        ino_in: u64,
+        fh_in: u64,
+        offset_in: i64,
+        ino_out: u64,
+        fh_out: u64,
+        offset_out: i64,
+        len: u64,
+        flags: u32,
+        reply: fuser::ReplyWrite,
+    ) {
+        println!(
+            "[Not Implemented] copy_file_range(ino_in: {:#x?}, fh_in: {}, \
+            offset_in: {}, ino_out: {:#x?}, fh_out: {}, offset_out: {}, \
+            len: {}, flags: {})",
+            ino_in, fh_in, offset_in, ino_out, fh_out, offset_out, len, flags
+        );
+        reply.error(ENOSYS);
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        println!(
+            "[Not Implemented] getxattr(ino: {:#x?}, name: {:?}, size: {})",
+            ino, name, size
+        );
+        reply.error(ENOSYS);
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
+        println!(
+            "[Not Implemented] listxattr(ino: {:#x?}, size: {})",
+            ino, size
+        );
+        reply.error(ENOSYS);
+    }
+
+    fn removexattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        println!(
+            "[Not Implemented] removexattr(ino: {:#x?}, name: {:?})",
+            ino, name
+        );
         reply.error(ENOSYS);
     }
 }
@@ -769,7 +920,18 @@ fn main() -> io::Result<()> {
     let mountpoint = String::from("../filesystem");
 
     std::fs::create_dir(&mountpoint)?;
-    let result = fuse::mount(fs, &mountpoint, &[]);
+    let result = fuser::mount2(
+        fs,
+        &mountpoint,
+        &[
+            MountOption::FSName("NoctFS".to_owned()),
+            MountOption::NoDev,
+            MountOption::NoSuid,
+            MountOption::Sync,
+            MountOption::NoAtime,
+            MountOption::RW,
+        ],
+    );
     std::fs::remove_dir(mountpoint)?;
 
     println!("Result: {:?}", result);
