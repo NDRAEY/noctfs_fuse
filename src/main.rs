@@ -39,14 +39,18 @@ impl NoctFSFused<'_> {
         let lsr = self.fs.list_directory(root.start_block);
 
         for i in &lsr {
-            if i.is_directory() && ![".", ".."].contains(&i.name.as_str()) {
-                return self.noct_search_by_block(i.start_block);
+            if [".", ".."].contains(&i.name.as_str()) {
+                continue;
             }
 
             if i.start_block == block {
                 return Some(i.clone());
             }
-        }
+ 
+            if i.is_directory() {
+                return self.noct_search_by_block(i.start_block);
+            }
+       }
 
         None
     }
@@ -158,6 +162,8 @@ impl Filesystem for NoctFSFused<'_> {
         let entity = entity.unwrap();
         self.ino_cache.add(parent, entity.start_block);
 
+        println!("{name:?} is ino {}", entity.start_block);
+
         reply.entry(
             &DEFAULT_DURATION,
             &self.entity_attrs_to_fuse_attrs(&entity),
@@ -188,7 +194,7 @@ impl Filesystem for NoctFSFused<'_> {
                     ctime: SystemTime::UNIX_EPOCH,
                     crtime: SystemTime::UNIX_EPOCH,
                     kind: FileType::Directory,
-                    perm: 0o666,
+                    perm: 0o644,
                     nlink: 0,
                     uid: 0,
                     gid: 0,
@@ -687,6 +693,9 @@ impl Filesystem for NoctFSFused<'_> {
 
     fn access(&mut self, _req: &fuser::Request, _ino: u64, _mask: i32, reply: fuser::ReplyEmpty) {
         println!("access: on ino/{_ino} with mask/{_mask}");
+
+        let parent = self.ino_cache.find_parent(_ino);
+        println!("Parent: {parent:?}");
 
         // Search inode across entire FS (may be slow, but idk what to do without parent ino)
         let a = self.noct_search_by_block(_ino);
