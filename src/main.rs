@@ -444,7 +444,7 @@ impl Filesystem for NoctFSFused<'_> {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        println!("read ino/{ino} fh/{fh}");
+        println!("read ino/{ino} fh/{fh}, offset: {offset}, size: {size}");
         println!("ino from fh is: {:?}", self.get_ino(fh));
 
         let dir_ino = self.ino_cache.find_parent(ino);
@@ -468,11 +468,15 @@ impl Filesystem for NoctFSFused<'_> {
 
         let ent = ent.unwrap();
 
+        println!("Got entity");
+
         let mut data = vec![0u8; size as usize];
 
         self.fs
             .read_contents_by_entity(&ent, &mut data, offset as _)
             .unwrap();
+
+        println!("Read ok");
 
         reply.data(data.as_slice());
     }
@@ -489,7 +493,7 @@ impl Filesystem for NoctFSFused<'_> {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
-        println!("\x1b[31mwrite\x1b[0m ino/{ino}; fh/{fh}");
+        println!("\x1b[31mwrite\x1b[0m ino/{ino}; fh/{fh} offset: {offset}, data_size: {}", data.len());
         println!("ino from fh is: {:?}", self.get_ino(fh));
 
         let dir_ino = self.ino_cache.find_parent(ino);
